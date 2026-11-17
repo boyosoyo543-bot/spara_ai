@@ -1,11 +1,18 @@
 {
-  "name": "smart-whatsapp-bot",
+  "name": "whatsapp-image-pdf-bot",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "latest",
-    "pino": "^9.0.0"
-  },
-  "engines": { "node": ">=20" }
+    "pdf-lib": "^1.17.1",
+    "pino": "^9.6.0",
+    "sharp": "^0.33.5"
+  }
 }
