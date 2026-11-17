@@ -12,6 +12,7 @@ import { PDFDocument } from 'pdf-lib'
 
 const AUTH_DIR = process.env.AUTH_DIR || './auth'
 const PHONE = (process.env.PHONE || '').replace(/[^0-9]/g, '')
+
 const PDF_PAGE_SIZE = (
   process.env.PDF_PAGE_SIZE || 'A4'
 ).toUpperCase()
@@ -44,14 +45,18 @@ function getMessageContent(message) {
   )
 }
 
-function getImageMedia(content) {
-  // صورة عادية من Gallery
+function getMedia(content) {
+  // صورة عادية من WhatsApp
   if (content?.imageMessage) {
-    return content.imageMessage
+    return {
+      kind: 'image',
+      media: content.imageMessage
+    }
   }
 
-  // صورة مرسلة كـDocument
-  const document = content?.documentMessage
+  // ملفات Documents المرسلة من CamScanner
+  const document =
+    content?.documentMessage
 
   if (!document) {
     return null
@@ -67,6 +72,18 @@ function getImageMedia(content) {
     document.fileName || ''
   ).toLowerCase()
 
+  // PDF جاهز من CamScanner
+  if (
+    mime === 'application/pdf' ||
+    name.endsWith('.pdf')
+  ) {
+    return {
+      kind: 'pdf',
+      media: document
+    }
+  }
+
+  // صور مرسلة كـDocument
   const isImage =
     mime.startsWith('image/') ||
     name.endsWith('.jpg') ||
@@ -74,7 +91,12 @@ function getImageMedia(content) {
     name.endsWith('.png') ||
     name.endsWith('.webp')
 
-  return isImage ? document : null
+  return isImage
+    ? {
+        kind: 'image',
+        media: document
+      }
+    : null
 }
 
 function getPageSize() {
@@ -86,7 +108,6 @@ function getPageSize() {
     return null
   }
 
-  // A4 هو الافتراضي
   return [595.28, 841.89]
 }
 
@@ -107,7 +128,7 @@ function fitInside(
   }
 }
 
-async function downloadImage(
+async function downloadMedia(
   message,
   sock
 ) {
@@ -115,7 +136,7 @@ async function downloadImage(
     setTimeout(() => {
       reject(
         new Error(
-          'تحميل الصورة خذا وقت طويل بزاف، عاود صيفطها من فضلك.'
+          'تحميل الملف خذا وقت طويل بزاف، عاود صيفطو من فضلك.'
         )
       )
     }, 30000)
@@ -129,7 +150,7 @@ async function downloadImage(
       {
         logger,
 
-        // إعادة طلب رابط الصورة إذا كان منتهي
+        // إعادة طلب الرابط إذا كان منتهي
         reuploadRequest: oldMessage =>
           sock.updateMediaMessage(oldMessage)
       }
@@ -141,56 +162,185 @@ async function downloadImage(
   ])
 }
 
-async function enhanceImage(
+function rowProjectionScore(
+  data,
+  width,
+  height
+) {
+  const rows =
+    new Array(height).fill(0)
+
+  for (
+    let y = 0;
+    y < height;
+    y += 1
+  ) {
+    let sum = 0
+
+    for (
+      let x = 0;
+      x < width;
+      x += 1
+    ) {
+      const value =
+        data[y * width + x]
+
+      // البكسلات الغامقة غالباً هي الكتابة
+      sum += Math.max(
+        0,
+        235 - value
+      )
+    }
+
+    rows[y] = sum
+  }
+
+  const mean =
+    rows.reduce(
+      (a, b) => a + b,
+      0
+    ) / rows.length
+
+  return rows.reduce(
+    (total, value) =>
+      total + ((value - mean) ** 2),
+    0
+  ) / rows.length
+}
+
+async function estimateDeskewAngle(
   inputBuffer
 ) {
-  const source = sharp(
-    inputBuffer,
-    {
-      failOn: 'none'
+  const angles = []
+
+  for (
+    let angle = -5;
+    angle <= 5;
+    angle += 1
+  ) {
+    angles.push(angle)
+  }
+
+  let bestAngle = 0
+  let bestScore = -Infinity
+
+  for (const angle of angles) {
+    const {
+      data,
+      info
+    } = await sharp(
+      inputBuffer,
+      {
+        failOn: 'none'
+      }
+    )
+      .rotate()
+      .rotate(angle, {
+        background: {
+          r: 255,
+          g: 255,
+          b: 255,
+          alpha: 1
+        }
+      })
+      .resize({
+        width: 900,
+        withoutEnlargement: true
+      })
+      .greyscale()
+      .raw()
+      .toBuffer({
+        resolveWithObject: true
+      })
+
+    const score =
+      rowProjectionScore(
+        data,
+        info.width,
+        info.height
+      )
+
+    if (score > bestScore) {
+      bestScore = score
+      bestAngle = angle
     }
-  )
+  }
+
+  return bestAngle
+}
+
+async function enhanceAndDeskewImage(
+  inputBuffer
+) {
+  const angle =
+    await estimateDeskewAngle(
+      inputBuffer
+    )
+
+  // تصحيح اتجاه الصورة والميلان
+  const rotated =
+    await sharp(
+      inputBuffer,
+      {
+        failOn: 'none'
+      }
+    )
+      .rotate()
+      .rotate(angle, {
+        background: {
+          r: 255,
+          g: 255,
+          b: 255,
+          alpha: 1
+        }
+      })
+      // قص الحواف البيضاء والفارغة
+      .trim({
+        background: {
+          r: 255,
+          g: 255,
+          b: 255,
+          alpha: 1
+        },
+        threshold: 22
+      })
+      // تحسين الإضاءة والتباين
+      .normalize()
+      // تقوية وضوح الكتابة
+      .sharpen({
+        sigma: 1.1,
+        m1: 0.7,
+        m2: 2.0
+      })
+      // PNG بدون ضغط ضياعي
+      .png({
+        compressionLevel: 9,
+        adaptiveFiltering: true
+      })
+      .toBuffer()
 
   const metadata =
-    await source.metadata()
+    await sharp(rotated).metadata()
 
-  const sourceWidth =
+  const width =
     metadata.width || 1600
 
-  const sourceHeight =
+  const height =
     metadata.height || 1200
 
-  const targetWidth =
-    Math.round(
-      sourceWidth * UPSCALE_FACTOR
-    )
-
-  const targetHeight =
-    Math.round(
-      sourceHeight * UPSCALE_FACTOR
-    )
-
-  // تحسين محلي مجاني:
-  // تصحيح الاتجاه
-  // تحسين contrast والإضاءة
-  // زيادة الحدة
-  // تكبير الصورة باستعمال Lanczos
-  return source
-    .rotate()
-    .normalize()
-    .sharpen({
-      sigma: 1.1,
-      m1: 0.7,
-      m2: 2.0
-    })
+  // تكبير حتى 2x
+  return sharp(rotated)
     .resize({
-      width: targetWidth,
-      height: targetHeight,
+      width: Math.round(
+        width * UPSCALE_FACTOR
+      ),
+      height: Math.round(
+        height * UPSCALE_FACTOR
+      ),
       fit: 'inside',
       kernel: sharp.kernel.lanczos3,
       withoutEnlargement: false
     })
-    // PNG lossless قبل إدخالها إلى PDF
     .png({
       compressionLevel: 9,
       adaptiveFiltering: true
@@ -198,18 +348,18 @@ async function enhanceImage(
     .toBuffer()
 }
 
-async function createPdfFromEnhancedImage(
+async function createPdfFromImage(
   imageBuffer
 ) {
   const pdfDoc =
     await PDFDocument.create()
 
   pdfDoc.setTitle(
-    'Enhanced WhatsApp Image'
+    'Enhanced CamScanner Image'
   )
 
   pdfDoc.setProducer(
-    'WhatsApp Local Image Enhancement Bot'
+    'WhatsApp CamScanner Bot'
   )
 
   const image =
@@ -223,7 +373,6 @@ async function createPdfFromEnhancedImage(
   const pageSize =
     getPageSize()
 
-  // الصفحة بنفس أبعاد الصورة المحسنة
   if (!pageSize) {
     const page = pdfDoc.addPage([
       dimensions.width,
@@ -377,7 +526,7 @@ async function start() {
           const chatId =
             message.key.remoteJid
 
-          // الخدمة خاصة فقط
+          // الخدمة خدامة غير فالخاص
           if (chatId.endsWith('@g.us')) {
             continue
           }
@@ -385,10 +534,10 @@ async function start() {
           const content =
             getMessageContent(message)
 
-          const image =
-            getImageMedia(content)
+          const media =
+            getMedia(content)
 
-          if (!image) {
+          if (!media) {
             const text = (
               content?.conversation ||
               content?.extendedTextMessage?.text ||
@@ -402,7 +551,7 @@ async function start() {
                 chatId,
                 {
                   text:
-                    'صيفط ليا صورة، وأنا نحسنها ونحولها مباشرة لـPDF.'
+                    'صيفط ليا صورة أو PDF من CamScanner.'
                 }
               )
             }
@@ -410,39 +559,81 @@ async function start() {
             continue
           }
 
+          // PDF جاهز من CamScanner
+          if (media.kind === 'pdf') {
+            await sock.sendMessage(
+              chatId,
+              {
+                text:
+                  '⏳ توصلت بـPDF ديال CamScanner، كنرجعو لك بجودتو الأصلية...'
+              }
+            )
+
+            const pdfBuffer =
+              await downloadMedia(
+                message,
+                sock
+              )
+
+            await sock.sendMessage(
+              chatId,
+              {
+                document: pdfBuffer,
+                mimetype:
+                  'application/pdf',
+                fileName:
+                  `camscanner-${Date.now()}.pdf`,
+                caption:
+                  '✅ توصلت بملف PDF الجاهز من CamScanner.'
+              }
+            )
+
+            await sock.sendMessage(
+              chatId,
+              {
+                text:
+                  'شكراً لاستعمال الخدمة.'
+              }
+            )
+
+            continue
+          }
+
+          // صورة من WhatsApp أو CamScanner
           await sock.sendMessage(
             chatId,
             {
               text:
-                '⏳ توصلت بالصورة، كنحسن الجودة ونوجد لك PDF...'
+                '⏳ توصلت بالصورة، كنقص الحواف ونصلح الميلان ونوجد PDF...'
             }
           )
 
           const originalBuffer =
-            await downloadImage(
+            await downloadMedia(
               message,
               sock
             )
 
-          const enhancedBuffer =
-            await enhanceImage(
+          const processedBuffer =
+            await enhanceAndDeskewImage(
               originalBuffer
             )
 
           const pdfBuffer =
-            await createPdfFromEnhancedImage(
-              enhancedBuffer
+            await createPdfFromImage(
+              processedBuffer
             )
 
           await sock.sendMessage(
             chatId,
             {
               document: pdfBuffer,
-              mimetype: 'application/pdf',
+              mimetype:
+                'application/pdf',
               fileName:
-                `enhanced-image-${Date.now()}.pdf`,
+                `scanned-image-${Date.now()}.pdf`,
               caption:
-                '✅ تفضل، حسنت الصورة وحولتها لـPDF.'
+                '✅ تفضل، قصيت الحواف وصلحت الميلان وحولت الصورة لـPDF.'
             }
           )
 
@@ -450,7 +641,7 @@ async function start() {
             chatId,
             {
               text:
-                'شكراً لاستعمال الخدمة. التحسين محلي ومجاني، وقد لا يرجع التفاصيل التي ضاعت نهائياً بسبب ضغط WhatsApp.'
+                'شكراً لاستعمال الخدمة. إذا كانت الورقة فوق خلفية معقدة، صيفطها كـDocument باش تبقى الجودة أحسن.'
             }
           )
         } catch (error) {
@@ -464,7 +655,7 @@ async function start() {
               message.key.remoteJid,
               {
                 text:
-                  `ماقدرتش نحسن الصورة دابا. ` +
+                  `ماقدرتش نعالج الملف دابا. ` +
                   `السبب: ${error.message}`
               },
               {
@@ -479,3 +670,4 @@ async function start() {
 }
 
 start()
+  
