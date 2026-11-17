@@ -1,289 +1,481 @@
 import makeWASocket, {
-  useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion,
-  downloadMediaMessage, normalizeMessageContent
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  downloadMediaMessage,
+  normalizeMessageContent
 } from '@whiskeysockets/baileys'
 import pino from 'pino'
 import fs from 'fs'
-import path from 'path'
+import sharp from 'sharp'
+import { PDFDocument } from 'pdf-lib'
+
+const AUTH_DIR = process.env.AUTH_DIR || './auth'
+const PHONE = (process.env.PHONE || '').replace(/[^0-9]/g, '')
+const PDF_PAGE_SIZE = (
+  process.env.PDF_PAGE_SIZE || 'A4'
+).toUpperCase()
+
+const UPSCALE_FACTOR = Math.min(
+  2,
+  Math.max(
+    1,
+    Number.parseFloat(
+      process.env.UPSCALE_FACTOR || '2'
+    ) || 2
+  )
+)
 
 const logger = pino({ level: 'silent' })
-const DATA_DIR = process.env.DATA_DIR || './data'
-fs.mkdirSync(DATA_DIR, { recursive: true })
-const AUTH_DIR = process.env.AUTH_DIR || path.join(DATA_DIR, 'auth')
-const CHATS_FILE = path.join(DATA_DIR, 'chats.json')
-const PROMPT = fs.readFileSync('./prompt.txt', 'utf8')
 
-const API_KEY = (process.env.GROQ_API_KEY || '').trim()
-const TEXT_MODELS = (process.env.GROQ_MODELS || 'openai/gpt-oss-120b,openai/gpt-oss-20b')
-  .split(',').map(s => s.trim()).filter(Boolean)
-const VISION_MODEL = (process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b').trim()
-const STT_MODEL = (process.env.GROQ_STT_MODEL || 'whisper-large-v3').trim()
-const REASONING = (process.env.REASONING_EFFORT || 'medium').trim() // low | medium | high
-const MAX_TOKENS = Number(process.env.MAX_TOKENS || 5000)
-const HISTORY_LIMIT = 12
-// اختياري: نمر مسموح لها فالخاص (أرقام فقط، مفرقة بفاصلة). فارغ = الكل.
-const ALLOWED_USERS = (process.env.ALLOWED_USERS || '')
-  .split(',').map(s => s.replace(/\D/g, '')).filter(Boolean)
+const sleep = ms =>
+  new Promise(resolve => setTimeout(resolve, ms))
 
-const FAIL = 'السيرفر مشغول دابا، عاود المحاولة من بعد شوية 🙏'
-const sleep = ms => new Promise(r => setTimeout(r, ms))
-const userPart = j => j?.split('@')[0].split(':')[0]
-
-// ---------- ذاكرة المحادثات (كتتحفظ فالـ Volume) ----------
-let chats = {}
-try { chats = JSON.parse(fs.readFileSync(CHATS_FILE, 'utf8')) } catch (e) { /* new */ }
-let saveTimer
-function save() {
-  clearTimeout(saveTimer)
-  saveTimer = setTimeout(() => {
-    try { fs.writeFileSync(CHATS_FILE, JSON.stringify(chats)) }
-    catch (e) { console.log('save failed:', e.message) }
-  }, 2000)
-}
-function pushHistory(jid, role, content) {
-  const arr = (chats[jid] ||= [])
-  arr.push({ role, content: String(content).slice(0, 3000) })
-  while (arr.length > HISTORY_LIMIT) arr.shift()
-  save()
+function ensureDirectories() {
+  fs.mkdirSync(AUTH_DIR, {
+    recursive: true
+  })
 }
 
-// ---------- حد الاستعمال (30 رسالة فـ 10 دقايق لكل واحد) ----------
-const hits = new Map()
-function limited(id) {
-  const now = Date.now()
-  const arr = (hits.get(id) || []).filter(t => now - t < 10 * 60 * 1000)
-  arr.push(now)
-  hits.set(id, arr)
-  return arr.length > 30
+function getMessageContent(message) {
+  return (
+    normalizeMessageContent(message.message) ||
+    message.message
+  )
 }
 
-// ---------- تقسيم الجواب الطويل ----------
-function chunks(text, max = 3500) {
-  const out = []
-  let cur = ''
-  for (const para of text.split('\n\n')) {
-    if (cur && (cur + '\n\n' + para).length > max) { out.push(cur); cur = '' }
-    if (para.length > max) {
-      for (let i = 0; i < para.length; i += max) out.push(para.slice(i, i + max))
-    } else {
-      cur = cur ? cur + '\n\n' + para : para
-    }
+function getImageMedia(content) {
+  // صورة عادية من Gallery
+  if (content?.imageMessage) {
+    return content.imageMessage
   }
-  if (cur) out.push(cur)
-  return out
-}
 
-// ---------- Groq ----------
-async function callGroq(model, messages) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const body = { model, messages, temperature: 0.6, max_completion_tokens: MAX_TOKENS }
-      if (model.includes('gpt-oss')) body.reasoning_effort = REASONING
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}` },
-        body: JSON.stringify(body)
-      })
-      const data = await res.json()
-      if (res.ok) {
-        const out = data?.choices?.[0]?.message?.content?.trim()
-        if (out) return out
-      }
-      console.log('GROQ ERROR', model, res.status, JSON.stringify(data).slice(0, 300))
-      if (![429, 500, 502, 503].includes(res.status)) break
-    } catch (e) {
-      console.log('GROQ FETCH ERROR', model, e.message)
-    }
-    await sleep(2000 * attempt)
-  }
-  return null
-}
+  // صورة مرسلة كـDocument
+  const document = content?.documentMessage
 
-async function askAI(jid, userText, images) {
-  if (!API_KEY) {
-    console.log('GROQ ERROR: GROQ_API_KEY is missing')
+  if (!document) {
     return null
   }
-  const now = new Date().toLocaleString('en-GB', { timeZone: 'Africa/Casablanca' })
-  const system = { role: 'system', content: `${PROMPT}\n\nالتاريخ والوقت الحالي (المغرب): ${now}` }
-  const past = chats[jid] || []
-  let out = null
 
-  if (images.length) {
-    const content = [
-      { type: 'text', text: userText || 'شنو كاين فهاد الصورة؟ حللها بالتفصيل.' },
-      ...images.slice(0, 3).map(b => ({
-        type: 'image_url',
-        image_url: { url: `data:image/jpeg;base64,${b.toString('base64')}` }
-      }))
-    ]
-    out = await callGroq(VISION_MODEL, [system, ...past, { role: 'user', content }])
-  } else {
-    for (const model of TEXT_MODELS) {
-      out = await callGroq(model, [system, ...past, { role: 'user', content: userText }])
-      if (out) break
-    }
-  }
-  if (out) {
-    pushHistory(jid, 'user', images.length ? `${userText} [صورة]` : userText)
-    pushHistory(jid, 'assistant', out)
-  }
-  return out
+  const mime = (
+    document.mimetype || ''
+  )
+    .split(';')[0]
+    .toLowerCase()
+
+  const name = (
+    document.fileName || ''
+  ).toLowerCase()
+
+  const isImage =
+    mime.startsWith('image/') ||
+    name.endsWith('.jpg') ||
+    name.endsWith('.jpeg') ||
+    name.endsWith('.png') ||
+    name.endsWith('.webp')
+
+  return isImage ? document : null
 }
 
-async function transcribe(buf) {
-  try {
-    const form = new FormData()
-    form.append('file', new Blob([buf], { type: 'audio/ogg' }), 'voice.ogg')
-    form.append('model', STT_MODEL)
-    const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${API_KEY}` },
-      body: form
-    })
-    const data = await res.json()
-    if (!res.ok) {
-      console.log('STT ERROR', res.status, JSON.stringify(data).slice(0, 300))
-      return null
-    }
-    return data?.text?.trim() || null
-  } catch (e) {
-    console.log('STT FETCH ERROR', e.message)
+function getPageSize() {
+  if (PDF_PAGE_SIZE === 'LETTER') {
+    return [612, 792]
+  }
+
+  if (PDF_PAGE_SIZE === 'ORIGINAL') {
     return null
   }
+
+  // A4 هو الافتراضي
+  return [595.28, 841.89]
 }
 
-// ---------- البوت ----------
-async function start() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-  const { version } = await fetchLatestBaileysVersion()
-  const sock = makeWASocket({ version, auth: state, logger })
-  let asked = false
+function fitInside(
+  width,
+  height,
+  maxWidth,
+  maxHeight
+) {
+  const scale = Math.min(
+    maxWidth / width,
+    maxHeight / height
+  )
 
-  const myIds = () => [sock.user?.id, sock.user?.lid].filter(Boolean).map(userPart)
+  return {
+    width: width * scale,
+    height: height * scale
+  }
+}
 
-  sock.ev.on('creds.update', saveCreds)
-
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr && !asked && !sock.authState.creds.registered && process.env.PHONE) {
-      asked = true
-      try {
-        const code = await sock.requestPairingCode(process.env.PHONE)
-        console.log('PAIRING CODE:', code)
-      } catch (e) {
-        console.log('pairing error:', e.message)
-        asked = false
-      }
-    }
-    if (connection === 'open') console.log('Bot connected')
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode
-      console.log('connection closed, code:', code)
-      if (code !== DisconnectReason.loggedOut) setTimeout(start, 3000)
-      else console.log('logged out, change AUTH_DIR and relink')
-    }
+async function downloadImage(
+  message,
+  sock
+) {
+  const timeout = new Promise((_, reject) => {
+    setTimeout(() => {
+      reject(
+        new Error(
+          'تحميل الصورة خذا وقت طويل بزاف، عاود صيفطها من فضلك.'
+        )
+      )
+    }, 30000)
   })
 
-  const getMedia = (msgObj, key) =>
+  const download =
     downloadMediaMessage(
-      { key, message: msgObj }, 'buffer', {},
-      { logger, reuploadRequest: sock.updateMediaMessage }
+      message,
+      'buffer',
+      {},
+      {
+        logger,
+
+        // إعادة طلب رابط الصورة إذا كان منتهي
+        reuploadRequest: oldMessage =>
+          sock.updateMediaMessage(oldMessage)
+      }
     )
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    for (const m of messages) {
-      try {
-        if (!m.message || m.key.fromMe) continue
-        const jid = m.key.remoteJid
-        if (!jid || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) continue
-        const isGroup = jid.endsWith('@g.us')
+  return Promise.race([
+    download,
+    timeout
+  ])
+}
 
-        const msg = normalizeMessageContent(m.message)
-        if (!msg) continue
-        const ext = msg.extendedTextMessage
-        const img = msg.imageMessage
-        const aud = msg.audioMessage
-        const text = msg.conversation || ext?.text || img?.caption || ''
-        const ctx = ext?.contextInfo || img?.contextInfo || aud?.contextInfo
-        const name = m.pushName || 'مستخدم'
-        const senderId = isGroup ? m.key.participant : jid
+async function enhanceImage(
+  inputBuffer
+) {
+  const source = sharp(
+    inputBuffer,
+    {
+      failOn: 'none'
+    }
+  )
 
-        // فالخاص: لائحة مسموحين (اختياري)
-        if (!isGroup && ALLOWED_USERS.length) {
-          const ids = [jid, m.key.remoteJidAlt].filter(Boolean)
-            .map(x => userPart(x).replace(/\D/g, ''))
-          if (!ids.some(i => ALLOWED_USERS.includes(i))) {
-            console.log('BLOCKED private chat:', ids.join(','))
-            continue
-          }
-        }
+  const metadata =
+    await source.metadata()
 
-        // فالجروب: غير فاش يتاغ البوت ولا يتجاوب على رسالة ديالو
-        const me = myIds()
-        if (isGroup) {
-          const mentioned = (ctx?.mentionedJid || []).some(j => me.includes(userPart(j)))
-          const repliedToBot = ctx?.participant && me.includes(userPart(ctx.participant))
-          if (!mentioned && !repliedToBot) continue
-        }
+  const sourceWidth =
+    metadata.width || 1600
 
-        const clean = text.replace(/@\d+/g, '').trim()
-        if (clean === '/reset') {
-          delete chats[jid]
-          save()
-          await sock.sendMessage(jid, { text: '🧹 تمسح السجل. نبداو من الأول.' }, { quoted: m })
-          continue
-        }
+  const sourceHeight =
+    metadata.height || 1200
 
-        if (limited(senderId || jid)) {
-          await sock.sendMessage(jid, { text: 'بشوية شوية 😅 بزاف د الرسائل، عاود من بعد شوية.' }, { quoted: m })
-          continue
-        }
+  const targetWidth =
+    Math.round(
+      sourceWidth * UPSCALE_FACTOR
+    )
 
-        let userText = clean
-        let transcript = null
-        const images = []
-        const q = ctx?.quotedMessage
-        const qKey = ctx?.stanzaId
-          ? { remoteJid: jid, id: ctx.stanzaId, participant: ctx.participant }
-          : null
+  const targetHeight =
+    Math.round(
+      sourceHeight * UPSCALE_FACTOR
+    )
+
+  // تحسين محلي مجاني:
+  // تصحيح الاتجاه
+  // تحسين contrast والإضاءة
+  // زيادة الحدة
+  // تكبير الصورة باستعمال Lanczos
+  return source
+    .rotate()
+    .normalize()
+    .sharpen({
+      sigma: 1.1,
+      m1: 0.7,
+      m2: 2.0
+    })
+    .resize({
+      width: targetWidth,
+      height: targetHeight,
+      fit: 'inside',
+      kernel: sharp.kernel.lanczos3,
+      withoutEnlargement: false
+    })
+    // PNG lossless قبل إدخالها إلى PDF
+    .png({
+      compressionLevel: 9,
+      adaptiveFiltering: true
+    })
+    .toBuffer()
+}
+
+async function createPdfFromEnhancedImage(
+  imageBuffer
+) {
+  const pdfDoc =
+    await PDFDocument.create()
+
+  pdfDoc.setTitle(
+    'Enhanced WhatsApp Image'
+  )
+
+  pdfDoc.setProducer(
+    'WhatsApp Local Image Enhancement Bot'
+  )
+
+  const image =
+    await pdfDoc.embedPng(
+      imageBuffer
+    )
+
+  const dimensions =
+    image.scale(1)
+
+  const pageSize =
+    getPageSize()
+
+  // الصفحة بنفس أبعاد الصورة المحسنة
+  if (!pageSize) {
+    const page = pdfDoc.addPage([
+      dimensions.width,
+      dimensions.height
+    ])
+
+    page.drawImage(image, {
+      x: 0,
+      y: 0,
+      width: dimensions.width,
+      height: dimensions.height
+    })
+  } else {
+    const [
+      pageWidth,
+      pageHeight
+    ] = pageSize
+
+    const fitted =
+      fitInside(
+        dimensions.width,
+        dimensions.height,
+        pageWidth,
+        pageHeight
+      )
+
+    const page = pdfDoc.addPage([
+      pageWidth,
+      pageHeight
+    ])
+
+    page.drawImage(image, {
+      x:
+        (pageWidth - fitted.width) / 2,
+      y:
+        (pageHeight - fitted.height) / 2,
+      width: fitted.width,
+      height: fitted.height
+    })
+  }
+
+  const bytes =
+    await pdfDoc.save({
+      useObjectStreams: true
+    })
+
+  return Buffer.from(bytes)
+}
+
+async function start() {
+  ensureDirectories()
+
+  const {
+    state,
+    saveCreds
+  } = await useMultiFileAuthState(
+    AUTH_DIR
+  )
+
+  const {
+    version
+  } = await fetchLatestBaileysVersion()
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger
+  })
+
+  let pairingRequested = false
+
+  sock.ev.on(
+    'creds.update',
+    saveCreds
+  )
+
+  sock.ev.on(
+    'connection.update',
+    async ({
+      connection,
+      lastDisconnect,
+      qr
+    }) => {
+      if (
+        qr &&
+        !pairingRequested &&
+        !sock.authState.creds.registered &&
+        PHONE
+      ) {
+        pairingRequested = true
 
         try {
-          if (img) images.push(await getMedia(msg, m.key))
-          else if (q?.imageMessage && qKey) images.push(await getMedia(q, qKey))
-          if (aud) {
-            transcript = await transcribe(await getMedia(msg, m.key))
-            if (!transcript) {
-              await sock.sendMessage(jid, { text: 'ما قدرتش نسمع الصوتية. عاود صيفطها ولا كتب لي.' }, { quoted: m })
-              continue
-            }
-            userText = transcript
-          }
-        } catch (e) {
-          console.log('media failed:', e.message)
+          const code =
+            await sock.requestPairingCode(
+              PHONE
+            )
+
+          console.log(
+            'PAIRING CODE:',
+            code
+          )
+        } catch (error) {
+          console.log(
+            'PAIRING ERROR:',
+            error.message
+          )
+
+          pairingRequested = false
         }
+      }
 
-        if (!userText && !images.length) continue
+      if (connection === 'open') {
+        console.log('Bot connected')
+      }
 
-        const quotedText = q?.conversation || q?.extendedTextMessage?.text
-        if (quotedText) userText = `[رسالة مقتبسة: ${quotedText}]\n${userText}`
-        if (isGroup) userText = `${name}: ${userText}`
+      if (connection === 'close') {
+        const code =
+          lastDisconnect?.error?.output?.statusCode
 
-        await sock.sendPresenceUpdate('composing', jid)
-        const reply = await askAI(jid, userText, images)
-        await sock.sendPresenceUpdate('paused', jid)
+        console.log(
+          'Connection closed, code:',
+          code
+        )
 
-        let out = reply || FAIL
-        if (transcript) out = `🎙️ سمعت: «${transcript}»\n\n${out}`
-        const parts = chunks(out)
-        for (const [i, part] of parts.entries()) {
-          await sock.sendMessage(jid, { text: part }, i === 0 ? { quoted: m } : {})
-          if (i < parts.length - 1) await sleep(700)
+        if (
+          code !== DisconnectReason.loggedOut
+        ) {
+          await sleep(3000)
+          start()
+        } else {
+          console.log(
+            'Logged out. Change AUTH_DIR and relink.'
+          )
         }
-      } catch (e) {
-        console.log('message error:', e.message)
       }
     }
-  })
+  )
+
+  sock.ev.on(
+    'messages.upsert',
+    async ({ messages }) => {
+      for (const message of messages) {
+        try {
+          if (
+            !message.message ||
+            message.key.fromMe
+          ) {
+            continue
+          }
+
+          const chatId =
+            message.key.remoteJid
+
+          // الخدمة خاصة فقط
+          if (chatId.endsWith('@g.us')) {
+            continue
+          }
+
+          const content =
+            getMessageContent(message)
+
+          const image =
+            getImageMedia(content)
+
+          if (!image) {
+            const text = (
+              content?.conversation ||
+              content?.extendedTextMessage?.text ||
+              ''
+            )
+              .trim()
+              .toLowerCase()
+
+            if (text === 'pdf') {
+              await sock.sendMessage(
+                chatId,
+                {
+                  text:
+                    'صيفط ليا صورة، وأنا نحسنها ونحولها مباشرة لـPDF.'
+                }
+              )
+            }
+
+            continue
+          }
+
+          await sock.sendMessage(
+            chatId,
+            {
+              text:
+                '⏳ توصلت بالصورة، كنحسن الجودة ونوجد لك PDF...'
+            }
+          )
+
+          const originalBuffer =
+            await downloadImage(
+              message,
+              sock
+            )
+
+          const enhancedBuffer =
+            await enhanceImage(
+              originalBuffer
+            )
+
+          const pdfBuffer =
+            await createPdfFromEnhancedImage(
+              enhancedBuffer
+            )
+
+          await sock.sendMessage(
+            chatId,
+            {
+              document: pdfBuffer,
+              mimetype: 'application/pdf',
+              fileName:
+                `enhanced-image-${Date.now()}.pdf`,
+              caption:
+                '✅ تفضل، حسنت الصورة وحولتها لـPDF.'
+            }
+          )
+
+          await sock.sendMessage(
+            chatId,
+            {
+              text:
+                'شكراً لاستعمال الخدمة. التحسين محلي ومجاني، وقد لا يرجع التفاصيل التي ضاعت نهائياً بسبب ضغط WhatsApp.'
+            }
+          )
+        } catch (error) {
+          console.log(
+            'MESSAGE ERROR:',
+            error.message
+          )
+
+          try {
+            await sock.sendMessage(
+              message.key.remoteJid,
+              {
+                text:
+                  `ماقدرتش نحسن الصورة دابا. ` +
+                  `السبب: ${error.message}`
+              },
+              {
+                quoted: message
+              }
+            )
+          } catch {}
+        }
+      }
+    }
+  )
 }
 
 start()
